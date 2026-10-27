@@ -1,0 +1,861 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Physics</title>
+<style>
+  /* Latar hitam, tanpa scroll, canvas memenuhi layar */
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
+  canvas { display: block; touch-action: none; }
+</style>
+</head>
+<body>
+<canvas id="canvas"></canvas>
+<!-- Matter.js = library physics (gravitasi, tabrakan, dll) -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/matter-js/0.19.0/matter.min.js"></script>
+<script>
+/* ============================================================
+   1. PENGATURAN (ubah di sini)
+   ============================================================ */
+// Kategori emoji partikel; setiap kategori berisi beberapa simbol untuk dipilih acak.
+const KATEGORI_EMOJI_PARTIKEL = {
+  heart: ["💗", "💖", "💕", "💞", "💓", "💘"],
+  star: ["⭐", "🌟", "✨", "💫"],
+  sparkle: ["✨", "💫", "🌠", "🪄"],
+  bubble: ["🫧", "🔵", "💎", "🩵"],
+  flower: ["🌸", "🌺", "🌼", "🌷", "💮", "🪷"],
+  nature: ["🍃", "🌿", "🍀", "🌱", "🍂", "🌾"],
+  fire: ["🔥", "❤️‍🔥", "💥", "☄️"],
+  magic: ["🔮", "🪄", "🧚", "🦄", "🪄", "✨"],
+  food: ["🍓", "🍒", "🍊", "🍋", "🍇", "🍬"],
+  weather: ["☁️", "🌈", "🌧️", "❄️", "☀️", "⚡"],
+  animal: ["🦋", "🐝", "🐞", "🐠", "🐣", "🐾"],
+  music: ["🎵", "🎶", "🎼", "🎤", "🎧"],
+  celestial: ["🌙", "☀️", "🪐", "🌍", "🌠", "🌌"],
+  celebration: ["🎉", "🎊", "🎈", "🪅", "🥳"],
+  crystal: ["💎", "🔷", "🔹", "🪩", "🧊"]
+};
+// Entri bisa berupa path/gambar contoh atau objek { src, partikel: { mode } }.
+const GAMBAR = [
+  { src: "gambar/agusha.png", partikel: { mode: "heart" } },
+  { src: buatGambarContoh(140, 140, "#ffd166", "⭐"), partikel: { mode: "star" } },
+  { src: buatGambarContoh(140, 140, "#a8dadc", "🫧"), partikel: { mode: "bubble" } },
+  { src: buatGambarContoh(140, 140, "#ffafcc", "🌸"), partikel: { mode: "flower" } },
+  buatGambarContoh(140, 140, "#343a40", "💀"),
+];
+const KECEPATAN_MAKS = 26;    // cukup tinggi agar lemparan terasa bertenaga
+const PUTARAN_MAKS   = 0.14;  // batas kecepatan berputar
+const LANGKAH        = 2;     // physics dihitung 4x per frame (lebih halus)
+const JELLY_MAKS     = 0.06;  // batas efek melar saat kotak diseret
+
+const DAYA_TARIK_MAGNET   = 0.0025; // Kekuatan tarik menuju kursor (makin besar makin cepat tiba)
+const PENGEREM_OVERSHOOT  = 0.90;   // Rem saat mendekati kursor (0.85 = rem kuat, 0.96 = rem licin)
+const SENSITIVITAS_LEPAS  = 650;    // Batas kibasan/flick mouse untuk melempar
+
+function buatGambarContoh(lebar, tinggi, warna, emoji) {
+  const c = document.createElement("canvas");
+  c.width = lebar;
+  c.height = tinggi;
+  const g = c.getContext("2d");
+  g.fillStyle = warna;
+  g.fillRect(0, 0, lebar, tinggi);
+  g.font = Math.min(lebar, tinggi) * 0.6 + "px serif";
+  g.textAlign = "center";
+  g.textBaseline = "middle";
+  g.fillText(emoji, lebar / 2, tinggi / 2 + 4);
+  return c.toDataURL();
+}
+
+/* ============================================================
+   2. PERSIAPAN
+   ============================================================ */
+const Engine     = Matter.Engine;
+const Bodies     = Matter.Bodies;
+const Body       = Matter.Body;
+const Composite  = Matter.Composite;
+const Mouse      = Matter.Mouse;
+const MouseConstraint = Matter.MouseConstraint;
+const Query      = Matter.Query;
+
+const canvas = document.getElementById("canvas");
+const ctx = canvas.getContext("2d");
+
+const mesin = Engine.create({ positionIterations: 20, velocityIterations: 16 });
+let dinding = [];
+const kotak = [];
+
+/* ============================================================
+   3. DINDING (supaya kotak tidak keluar layar)
+   ============================================================ */
+function aturUkuranLayar() {
+  canvas.width = window.innerWidth;
+  canvas.height = window.innerHeight;
+  Composite.remove(mesin.world, dinding);
+  const tebal = 200;
+  const W = canvas.width;
+  const H = canvas.height;
+  const lantai = Bodies.rectangle(W / 2, H + tebal / 2, W + tebal * 2, tebal, { isStatic: true });
+  const kiri   = Bodies.rectangle(-tebal / 2, H / 2, tebal, H * 4, { isStatic: true });
+  const kanan  = Bodies.rectangle(W + tebal / 2, H / 2, tebal, H * 4, { isStatic: true });
+  dinding = [lantai, kiri, kanan];
+  Composite.add(mesin.world, dinding);
+}
+window.addEventListener("resize", aturUkuranLayar);
+aturUkuranLayar();
+
+/* ============================================================
+   4. KOTAK GAMBAR
+   ============================================================ */
+let sisaGambar = GAMBAR.length;
+const semuaGambar = [];
+GAMBAR.forEach(function (sumber, i) {
+  const gambar = new Image();
+  gambar.onload = function () {
+    semuaGambar[i] = gambar;
+    sisaGambar--;
+    if (sisaGambar === 0) buatKotak();
+  };
+  gambar.onerror = function () {
+    // Abaikan hanya gambar yang gagal dimuat; gambar lain tetap dapat spawn.
+    sisaGambar--;
+    if (sisaGambar === 0) buatKotak();
+  };
+  gambar.src = typeof sumber === "string" ? sumber : sumber.src;
+});
+
+function buatKotak() {
+  // Bola ajaib dibuat 150 × 150 px; gambar lain dibatasi hingga 1,2× patokan itu.
+  const BATAS_UKURAN = 150 * 1.2;
+  const skalaMobile = window.matchMedia("(max-width: 700px), (pointer: coarse)").matches ? 0.65 : 1;
+  for (let i = 0; i < semuaGambar.length; i++) {
+    const gambar = semuaGambar[i];
+    if (!gambar) continue;
+    const konfigurasi = typeof GAMBAR[i] === "string" ? {} : GAMBAR[i];
+    const skala = Math.min(skalaMobile, BATAS_UKURAN / gambar.naturalWidth, BATAS_UKURAN / gambar.naturalHeight);
+    const lebar = gambar.naturalWidth * skala;
+    const tinggi = gambar.naturalHeight * skala;
+    const margin = Math.min(lebar / 2, canvas.width / 2);
+    const x = margin + Math.random() * Math.max(0, canvas.width - margin * 2);
+    const y = -tinggi - 30 - i * (tinggi + 90);
+    const benda = Bodies.rectangle(x, y, lebar, tinggi, {
+      restitution: 0.5,
+      friction: 0.38
+    });
+    Body.setAngle(benda, (Math.random() - 0.5) * 0.8);
+    Composite.add(mesin.world, benda);
+    kotak.push({
+      gambar: gambar, benda: benda, lebar: lebar, tinggi: tinggi,
+      regangX: 1, regangY: 1, kecepatanRegangX: 0, kecepatanRegangY: 0,
+      getar: 0, faseGetar: Math.random() * Math.PI * 2,
+      waktuLepas: 0, kecepatanGetar: 0,
+      efekPartikel: konfigurasi.partikel || null,
+      partikelObjek: konfigurasi.partikel ? [] : null,
+      waktuPartikel: 0
+    });
+  }
+}
+
+/* ============================================================
+   5. INTERAKSI & MAGNET
+   ============================================================ */
+const mouse = Mouse.create(canvas);
+mouse.pixelRatio = 1;
+const geser = MouseConstraint.create(mesin, {
+  mouse: mouse,
+  constraint: {
+    stiffness: 0.095,
+    damping: 0.03,
+    render: { visible: false }
+  }
+});
+Composite.add(mesin.world, geser);
+
+const JARI_JARI_LEDAKAN = 560;
+const DAYA_LEDAKAN = 20;
+const ledakan = [];
+const gelombangLedakan = [];
+const asapTerpisah = [];
+const perangkatMobile = window.matchMedia("(max-width: 700px), (pointer: coarse)").matches;
+
+// Audio dibuat saat interaksi pertama agar tetap kompatibel dengan kebijakan autoplay browser.
+let audioContext = null;
+let masterGain = null;
+let suaraMagnet = null;
+let waktuBenturTerakhir = -Infinity;
+let waktuLedakanTerakhir = -Infinity;
+let bufferNoiseLedakan = null;
+function siapkanAudio() {
+  if (!audioContext) {
+    const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+    if (!AudioContextClass) return false;
+    audioContext = new AudioContextClass();
+    masterGain = audioContext.createGain();
+    masterGain.gain.value = 0.35;
+    // Compressor meredam puncak saat banyak benturan terjadi hampir bersamaan.
+    const compressor = audioContext.createDynamicsCompressor();
+    compressor.threshold.value = -20;
+    compressor.knee.value = 18;
+    compressor.ratio.value = 8;
+    compressor.attack.value = 0.004;
+    compressor.release.value = 0.16;
+    masterGain.connect(compressor);
+    compressor.connect(audioContext.destination);
+  }
+  if (audioContext.state === "suspended") audioContext.resume();
+  return true;
+}
+
+function bunyikanBenturan(kecepatan) {
+  if (!siapkanAudio()) return;
+  const sekarang = audioContext.currentTime;
+  // Jaga bunyi tetap rapat saat kotak didorong melewati tumpukan, tanpa suara menumpuk liar.
+  if (sekarang - waktuBenturTerakhir < 0.025) return;
+  waktuBenturTerakhir = sekarang;
+  const durasi = 0.09 + kecepatan * 0.012;
+  const osilator = audioContext.createOscillator();
+  const gain = audioContext.createGain();
+  osilator.type = "triangle";
+  osilator.frequency.setValueAtTime(150 + kecepatan * 34, sekarang);
+  osilator.frequency.exponentialRampToValueAtTime(65, sekarang + durasi);
+  const level = Math.min(0.2, 0.025 + kecepatan * 0.014);
+  gain.gain.setValueAtTime(0.001, sekarang);
+  gain.gain.linearRampToValueAtTime(level, sekarang + 0.003);
+  gain.gain.exponentialRampToValueAtTime(0.001, sekarang + durasi);
+  osilator.connect(gain);
+  gain.connect(masterGain);
+  osilator.start(sekarang);
+  osilator.stop(sekarang + durasi);
+}
+
+function bunyikanLedakan() {
+  if (!siapkanAudio()) return;
+  const sekarang = audioContext.currentTime;
+  // Saat ledakan dispam di ponsel, gabungkan pemicu suara yang terlalu rapat.
+  if (perangkatMobile && sekarang - waktuLedakanTerakhir < 0.16) return;
+  waktuLedakanTerakhir = sekarang;
+  const durasi = 0.95;
+  if (!bufferNoiseLedakan) {
+    bufferNoiseLedakan = audioContext.createBuffer(1, Math.floor(audioContext.sampleRate * durasi), audioContext.sampleRate);
+    const data = bufferNoiseLedakan.getChannelData(0);
+    for (let i = 0; i < data.length; i++) {
+      const t = i / data.length;
+      data[i] = (Math.random() * 2 - 1) * (1 - t) ** 1.8;
+    }
+  }
+  const noise = audioContext.createBufferSource();
+  const lowpass = audioContext.createBiquadFilter();
+  const gain = audioContext.createGain();
+  noise.buffer = bufferNoiseLedakan;
+  lowpass.type = "lowpass";
+  lowpass.frequency.setValueAtTime(1100, sekarang);
+  lowpass.frequency.exponentialRampToValueAtTime(95, sekarang + durasi);
+  gain.gain.setValueAtTime(0.9, sekarang);
+  gain.gain.exponentialRampToValueAtTime(0.001, sekarang + durasi);
+  noise.connect(lowpass);
+  lowpass.connect(gain);
+  gain.connect(masterGain);
+  noise.start(sekarang);
+  noise.stop(sekarang + durasi);
+
+  // Dentuman sub-bass yang tumpul memberi bobot tanpa bunyi ketukan keras.
+  [0.015, 0.085].forEach(function (jeda, i) {
+    const dentum = audioContext.createOscillator();
+    const gainDentum = audioContext.createGain();
+    const mulai = sekarang + jeda;
+    const akhir = mulai + 0.28 + i * 0.08;
+    dentum.type = "sine";
+    dentum.frequency.setValueAtTime(68 - i * 8, mulai);
+    dentum.frequency.exponentialRampToValueAtTime(28, akhir);
+    gainDentum.gain.setValueAtTime(0.38 - i * 0.1, mulai);
+    gainDentum.gain.exponentialRampToValueAtTime(0.001, akhir);
+    dentum.connect(gainDentum);
+    gainDentum.connect(masterGain);
+    dentum.start(mulai);
+    dentum.stop(akhir);
+  });
+}
+
+function mulaiSuaraMagnet() {
+  if (!siapkanAudio() || suaraMagnet) return;
+  const sekarang = audioContext.currentTime;
+  const osilator = audioContext.createOscillator();
+  const osilatorAtas = audioContext.createOscillator();
+  const gain = audioContext.createGain();
+  const gainAtas = audioContext.createGain();
+  const lfo = audioContext.createOscillator();
+  const lfoGain = audioContext.createGain();
+  const filter = audioContext.createBiquadFilter();
+  osilator.type = "sawtooth";
+  osilator.frequency.value = 92;
+  osilatorAtas.type = "triangle";
+  osilatorAtas.frequency.value = 184;
+  lfo.type = "sine";
+  lfo.frequency.value = 5.5;
+  lfoGain.gain.value = 18;
+  lfo.connect(lfoGain);
+  lfoGain.connect(osilator.frequency);
+  lfoGain.connect(osilatorAtas.frequency);
+  filter.type = "lowpass";
+  filter.frequency.value = 750;
+  filter.Q.value = 1.1;
+  gain.gain.setValueAtTime(0, sekarang);
+  gain.gain.linearRampToValueAtTime(0.25, sekarang + 0.12);
+  gainAtas.gain.setValueAtTime(0, sekarang);
+  gainAtas.gain.linearRampToValueAtTime(0.08, sekarang + 0.12);
+  osilator.connect(filter);
+  filter.connect(gain);
+  gain.connect(masterGain);
+  osilatorAtas.connect(gainAtas);
+  gainAtas.connect(masterGain);
+  osilator.start(sekarang);
+  osilatorAtas.start(sekarang);
+  lfo.start(sekarang);
+  suaraMagnet = { osilator: osilator, osilatorAtas: osilatorAtas, gain: gain, gainAtas: gainAtas, lfo: lfo };
+}
+
+function hentikanSuaraMagnet() {
+  if (!suaraMagnet || !audioContext) return;
+  const sekarang = audioContext.currentTime;
+  const suara = suaraMagnet;
+  suaraMagnet = null;
+  suara.gain.gain.cancelScheduledValues(sekarang);
+  suara.gain.gain.setTargetAtTime(0, sekarang, 0.04);
+  suara.gainAtas.gain.cancelScheduledValues(sekarang);
+  suara.gainAtas.gain.setTargetAtTime(0, sekarang, 0.04);
+  suara.osilator.stop(sekarang + 0.2);
+  suara.osilatorAtas.stop(sekarang + 0.2);
+  suara.lfo.stop(sekarang + 0.2);
+}
+const magnet = {
+  aktif: false, x: 0, y: 0, fase: 0,
+  mulaiX: 0, mulaiY: 0, mulaiWaktu: 0,
+  vx: 0, vy: 0, waktuGerak: 0
+};
+
+// Tekstur Asap Sekali Render
+const teksturAsap = document.createElement("canvas");
+teksturAsap.width = teksturAsap.height = 64;
+const ctxAsap = teksturAsap.getContext("2d");
+const gradienAsap = ctxAsap.createRadialGradient(32, 32, 2, 32, 32, 32);
+gradienAsap.addColorStop(0, "rgba(155, 160, 172, 0.82)");
+gradienAsap.addColorStop(0.72, "rgba(105, 111, 124, 0.72)");
+gradienAsap.addColorStop(0.94, "rgba(70, 76, 88, 0.3)");
+gradienAsap.addColorStop(1, "rgba(56, 60, 72, 0)");
+ctxAsap.fillStyle = gradienAsap;
+ctxAsap.fillRect(0, 0, 64, 64);
+
+// Glow ledakan dirender sekali sebagai tekstur, bukan membuat gradient tiap frame.
+const teksturLedakan = document.createElement("canvas");
+teksturLedakan.width = teksturLedakan.height = 128;
+const ctxLedakan = teksturLedakan.getContext("2d");
+const gradienLedakan = ctxLedakan.createRadialGradient(64, 64, 0, 64, 64, 64);
+gradienLedakan.addColorStop(0, "rgba(255, 248, 205, 0.8)");
+gradienLedakan.addColorStop(0.28, "rgba(255, 151, 54, 0.5)");
+gradienLedakan.addColorStop(1, "rgba(255, 45, 20, 0)");
+ctxLedakan.fillStyle = gradienLedakan;
+ctxLedakan.fillRect(0, 0, 128, 128);
+
+canvas.addEventListener("pointerdown", function (event) {
+  siapkanAudio();
+  const rect = canvas.getBoundingClientRect();
+  const titik = {
+    x: event.clientX - rect.left,
+    y: event.clientY - rect.top
+  };
+  const terkenaKotak = Query.point(kotak.map(function (k) { return k.benda; }), titik).length > 0;
+  
+  // Jika klik mengenai kotak, biarkan MouseConstraint yang menangani (drag biasa)
+  if (terkenaKotak) return;
+
+  // JIKA KLIK DI RUANG KOSONG: Aktifkan mode Magnet
+  magnet.aktif = true;
+  mulaiSuaraMagnet();
+  magnet.x = titik.x;
+  magnet.y = titik.y;
+  magnet.mulaiX = titik.x;
+  magnet.mulaiY = titik.y;
+  magnet.mulaiWaktu = performance.now();
+  magnet.vx = 0;
+  magnet.vy = 0;
+  magnet.waktuGerak = performance.now();
+
+  // KUNCI PERBAIKAN: Matikan deteksi tabrakan MouseConstraint saat magnet aktif
+  // agar kotak yang tertarik tidak sengaja terikat/terkunci oleh kursor
+  geser.collisionFilter.mask = 0;
+});
+
+function buatLedakan(titik) {
+  bunyikanLedakan();
+  const jumlahTerkena = kotak.reduce(function (jumlah, k) {
+    return jumlah + (Math.hypot(k.benda.position.x - titik.x, k.benda.position.y - titik.y) < JARI_JARI_LEDAKAN ? 1 : 0);
+  }, 0);
+  // Sedikit penguatan kelompok membuat ledakan terasa lebih besar saat banyak kotak berdekatan.
+  const bonusKelompok = 1 + Math.min(0.65, Math.max(0, jumlahTerkena - 1) * 0.08);
+  kotak.forEach(function (k) {
+    const dx = k.benda.position.x - titik.x;
+    const dy = k.benda.position.y - titik.y;
+    const jarak = Math.hypot(dx, dy);
+    if (jarak >= JARI_JARI_LEDAKAN) return;
+    const arahX = jarak > 0 ? dx / jarak : (Math.random() - 0.5) * 2;
+    let arahY = jarak > 0 ? dy / jarak : -1;
+    // Kotak yang bertumpu di lantai mendapat dorongan ke atas yang jelas.
+    if (k.benda.position.y + k.tinggi * 0.5 >= canvas.height - 8) {
+      arahY = Math.min(arahY, -0.95);
+    }
+    const skala = 1 - jarak / JARI_JARI_LEDAKAN;
+    const impuls = DAYA_LEDAKAN * bonusKelompok * skala * skala;
+    gelombangLedakan.push({
+      benda: k.benda,
+      arahX: arahX,
+      arahY: arahY,
+      // Pertahankan tenaga ledakan besar; hanya sebarkan kenaikan kecepatannya dalam waktu singkat.
+      perubahanKecepatan: impuls * 5.4,
+      umur: 0,
+      durasi: 0.2,
+      progresSebelumnya: 0
+    });
+    k.kecepatanGetar = Math.min(k.kecepatanGetar + skala * 0.045, 0.06);
+  });
+  const partikel = [];
+  for (let i = 0; i < (perangkatMobile ? 8 : 24); i++) {
+    const sudut = Math.random() * Math.PI * 2;
+    const laju = 1.5 + Math.random() * 8;
+    partikel.push({
+      x: titik.x, y: titik.y,
+      vx: Math.cos(sudut) * laju,
+      vy: Math.sin(sudut) * laju,
+      ukuran: 1.5 + Math.random() * 4,
+      warna: Math.random() < 0.5 ? "255, 191, 73" : "255, 92, 48"
+    });
+  }
+  const batasLedakanAktif = perangkatMobile ? 3 : 8;
+  if (ledakan.length >= batasLedakanAktif) ledakan.shift();
+  ledakan.push({ x: titik.x, y: titik.y, umur: 0, partikel: partikel, rotasi: Math.random() * Math.PI });
+}
+
+canvas.addEventListener("pointermove", function (event) {
+  if (!magnet.aktif) return;
+  const rect = canvas.getBoundingClientRect();
+  const x = event.clientX - rect.left;
+  const y = event.clientY - rect.top;
+  const sekarang = performance.now();
+  const dt = Math.max((sekarang - magnet.waktuGerak) / 1000, 1 / 120);
+  
+  // Hitung kecepatan geser kursor magnet (dipakai untuk flick-to-release)
+  magnet.vx = (x - magnet.x) / dt;
+  magnet.vy = (y - magnet.y) / dt;
+  magnet.x = x;
+  magnet.y = y;
+  magnet.waktuGerak = sekarang;
+});
+
+function lepasMagnet() {
+  if (magnet.aktif) {
+    const gerak = Math.hypot(magnet.x - magnet.mulaiX, magnet.y - magnet.mulaiY);
+    const ditahan = performance.now() - magnet.mulaiWaktu;
+    if (ditahan < 220 && gerak < 10) buatLedakan({ x: magnet.x, y: magnet.y });
+  }
+  magnet.aktif = false;
+  hentikanSuaraMagnet();
+  // Pulihkan kembali kemampuan MouseConstraint untuk mengambil kotak
+  geser.collisionFilter.mask = 0xFFFFFFFF;
+}
+
+window.addEventListener("pointerup", lepasMagnet);
+window.addEventListener("pointercancel", lepasMagnet);
+
+// Melacak kecepatan mouse untuk lemparan manual (Fling)
+let posisiKursorSebelumnya = { x: mouse.position.x, y: mouse.position.y };
+let lajuKursor = { x: 0, y: 0 };
+let waktuKursorSebelumnya = performance.now();
+
+Matter.Events.on(geser, "mousemove", function () {
+  const sekarang = performance.now();
+  const dt = Math.max((sekarang - waktuKursorSebelumnya) / 1000, 1 / 120);
+  lajuKursor = {
+    x: (mouse.position.x - posisiKursorSebelumnya.x) / dt,
+    y: (mouse.position.y - posisiKursorSebelumnya.y) / dt
+  };
+  // Gerakan kursor yang menyapu melewati titik pegangan memberi torsi pada kotak,
+  // seperti bingkai yang berayun pada paku tempat ia dipegang.
+  if (geser.body) {
+    const benda = geser.body;
+    const lokal = geser.constraint.pointB;
+    const cos = Math.cos(benda.angle);
+    const sin = Math.sin(benda.angle);
+    const rx = lokal.x * cos - lokal.y * sin;
+    const ry = lokal.x * sin + lokal.y * cos;
+    const jarakKuadrat = rx * rx + ry * ry;
+    if (jarakKuadrat > 100) {
+      const torsiKursor = (rx * lajuKursor.y - ry * lajuKursor.x) / jarakKuadrat;
+      const doronganPutar = Math.max(-0.045, Math.min(0.045, torsiKursor * 0.006));
+      Body.setAngularVelocity(benda, benda.angularVelocity + doronganPutar);
+    }
+  }
+  posisiKursorSebelumnya = { x: mouse.position.x, y: mouse.position.y };
+  waktuKursorSebelumnya = sekarang;
+});
+
+Matter.Events.on(geser, "enddrag", function (event) {
+  const vx = Math.max(-24, Math.min(24, lajuKursor.x * 0.045));
+  const vy = Math.max(-24, Math.min(24, lajuKursor.y * 0.045));
+  Body.setVelocity(event.body, { x: vx, y: vy });
+});
+
+Matter.Events.on(geser, "startdrag", function () {
+  posisiKursorSebelumnya = { x: mouse.position.x, y: mouse.position.y };
+  lajuKursor = { x: 0, y: 0 };
+  waktuKursorSebelumnya = performance.now();
+});
+
+Matter.Events.on(mesin, "collisionStart", function (event) {
+  let benturanTerkeras = 0;
+  event.pairs.forEach(function (pasangan) {
+    const bendaA = pasangan.bodyA;
+    const bendaB = pasangan.bodyB;
+    const kotakA = kotak.find(function (item) { return item.benda === bendaA; });
+    const kotakB = kotak.find(function (item) { return item.benda === bendaB; });
+    const nx = pasangan.collision.normal.x;
+    const ny = pasangan.collision.normal.y;
+
+    [kotakA, kotakB].forEach(function (k) {
+      if (!k) return;
+      const kecepatanBentur = Math.min(k.benda.speed / KECEPATAN_MAKS, 1);
+      if (kecepatanBentur > benturanTerkeras) benturanTerkeras = kecepatanBentur;
+      const impuls = kecepatanBentur * 0.055;
+      k.kecepatanRegangX += Math.abs(nx) > Math.abs(ny) ? -impuls : impuls * 0.55;
+      k.kecepatanRegangY += Math.abs(ny) >= Math.abs(nx) ? -impuls : impuls * 0.55;
+      k.kecepatanGetar = Math.min(k.kecepatanGetar + impuls * 0.12, 0.025);
+    });
+
+    // Tambahkan transfer momentum hanya pada benturan antarkotak yang sedang saling mendekat.
+    if (kotakA && kotakB && !bendaA.isStatic && !bendaB.isStatic) {
+      const relX = bendaB.velocity.x - bendaA.velocity.x;
+      const relY = bendaB.velocity.y - bendaA.velocity.y;
+      const lajuMendekat = -(relX * nx + relY * ny);
+      if (lajuMendekat > 0) {
+        const massaEfektif = 1 / (1 / bendaA.mass + 1 / bendaB.mass);
+        const besarImpuls = lajuMendekat * massaEfektif * 0.28;
+        Body.setVelocity(bendaA, {
+          x: bendaA.velocity.x - nx * besarImpuls / bendaA.mass,
+          y: bendaA.velocity.y - ny * besarImpuls / bendaA.mass
+        });
+        Body.setVelocity(bendaB, {
+          x: bendaB.velocity.x + nx * besarImpuls / bendaB.mass,
+          y: bendaB.velocity.y + ny * besarImpuls / bendaB.mass
+        });
+      }
+    }
+  });
+  // Satu suara per langkah fisika; pilih dampak terkuat agar tumpukan tidak menggandakan volume.
+  if (benturanTerkeras > 0.08) bunyikanBenturan(benturanTerkeras * KECEPATAN_MAKS);
+});
+
+function perbaruiEfekJelly() {
+  const bendaDitarik = geser.body;
+  kotak.forEach(function (k) {
+    const v = k.benda.velocity;
+    const aktif = k.benda === bendaDitarik;
+    const lajuX = Math.min(Math.abs(v.x) / KECEPATAN_MAKS, 1);
+    const lajuY = Math.min(Math.abs(v.y) / KECEPATAN_MAKS, 1);
+    const kecepatanTarik = aktif ? Math.hypot(v.x, v.y) : 0;
+    const reganganTarik = Math.min(kecepatanTarik / 12, 1);
+    const targetX = aktif ? 1 + Math.min(Math.abs(v.x) / 12, 1) * JELLY_MAKS - Math.min(Math.abs(v.y) / 12, 1) * 0.025 : 1;
+    const targetY = aktif ? 1 + Math.min(Math.abs(v.y) / 12, 1) * JELLY_MAKS - Math.min(Math.abs(v.x) / 12, 1) * 0.025 : 1;
+
+    k.kecepatanRegangX += (targetX - k.regangX) * (aktif ? 0.1 : 0.16);
+    k.kecepatanRegangX *= aktif ? 0.93 : 0.93;
+    k.kecepatanRegangY += (targetY - k.regangY) * (aktif ? 0.1 : 0.16);
+    k.kecepatanRegangY *= aktif ? 0.93 : 0.93;
+    k.regangX = Math.max(0.62, Math.min(1.5, k.regangX + k.kecepatanRegangX));
+    k.regangY = Math.max(0.62, Math.min(1.5, k.regangY + k.kecepatanRegangY));
+    k.faseGetar += 0.42 + (lajuX + lajuY) * 0.55;
+
+    if (aktif) {
+      k.waktuLepas = 2.8;
+      k.getar = Math.max(k.getar, reganganTarik * 0.008);
+    } else {
+      k.waktuLepas = Math.max(0, k.waktuLepas - 1 / 60);
+      k.getar = Math.max(k.kecepatanGetar, k.getar * (k.waktuLepas > 0 ? 0.991 : 0.9));
+      k.kecepatanGetar *= 0.94;
+    }
+    k.miringJelly = aktif ? Math.max(-0.025, Math.min(0.025, v.x * 0.003)) : (k.miringJelly || 0) * 0.9;
+  });
+}
+
+function batasiKecepatan(benda) {
+  const v = benda.velocity;
+  const laju = Math.hypot(v.x, v.y);
+  if (laju > KECEPATAN_MAKS) {
+    const skala = KECEPATAN_MAKS / laju;
+    Body.setVelocity(benda, { x: v.x * skala, y: v.y * skala });
+  }
+  if (Math.abs(benda.angularVelocity) > PUTARAN_MAKS) {
+    Body.setAngularVelocity(benda, Math.sign(benda.angularVelocity) * PUTARAN_MAKS);
+  }
+}
+
+/* ============================================================
+   6. LOOP ANIMASI
+   ============================================================ */
+/* ============================================================
+   6. LOOP ANIMASI (Dengan Anti-Overshoot & Auto-Return Cepat)
+   ============================================================ */
+let waktuTerakhir = performance.now();
+
+function animasi(waktuSekarang) {
+  const selisih = Math.min(waktuSekarang - waktuTerakhir, 32);
+  waktuTerakhir = waktuSekarang;
+
+  // Deteksi ayunan/sentakan kursor
+  const lajuSentakanKursor = Math.hypot(magnet.vx, magnet.vy);
+  const sedangDisentak = lajuSentakanKursor > SENSITIVITAS_LEPAS;
+  const faktorPelepas = Math.max(0.05, 1 - Math.min(lajuSentakanKursor / SENSITIVITAS_LEPAS, 0.95));
+
+  // Jalankan perhitungan fisika
+  for (let s = 0; s < LANGKAH; s++) {
+    // Gaya ledakan merambat selama 0,2 detik; percepatannya tumbuh halus hingga penuh.
+    for (let i = gelombangLedakan.length - 1; i >= 0; i--) {
+      const gelombang = gelombangLedakan[i];
+      const dtDetik = (selisih / LANGKAH) / 1000;
+      gelombang.umur += dtDetik;
+      const t = Math.min(1, gelombang.umur / gelombang.durasi);
+      const progres = t * t * (3 - 2 * t);
+      const tambahan = progres - gelombang.progresSebelumnya;
+      gelombang.progresSebelumnya = progres;
+      if (tambahan > 0 && !gelombang.benda.isStatic) {
+        Body.setVelocity(gelombang.benda, {
+          x: gelombang.benda.velocity.x + gelombang.arahX * gelombang.perubahanKecepatan * tambahan,
+          y: gelombang.benda.velocity.y + gelombang.arahY * gelombang.perubahanKecepatan * tambahan
+        });
+      }
+      if (t >= 1) gelombangLedakan.splice(i, 1);
+    }
+
+    if (magnet.aktif) {
+      kotak.forEach(function (k) {
+        const dx = magnet.x - k.benda.position.x;
+        const dy = magnet.y - k.benda.position.y;
+        const jarak = Math.hypot(dx, dy);
+
+        // Abaikan hanya jika tepat di kursor; medan magnet tidak memiliki batas jarak.
+        if (jarak < 2) return;
+
+        const arahX = dx / jarak;
+        const arahY = dy / jarak;
+        // Tarikan magnet tetap penuh meski kursor bergerak cepat.
+        const fTarik = DAYA_TARIK_MAGNET * k.benda.mass;
+
+        // Seimbangkan gravitasi setiap saat agar kotak tidak turun ketika magnet digeser cepat.
+        const doronganAngkat = -0.0011 * k.benda.mass;
+
+        Body.applyForce(k.benda, k.benda.position, {
+          x: arahX * fTarik,
+          y: (arahY * fTarik) + doronganAngkat
+        });
+
+        // 3. PENGEREMAN DINAMIS (Mencegah terpental bablas ke atas)
+        // Aktif hanya saat mendekati kursor (< 150px) dan TIDAK sedang dilempar/disentak
+        if (jarak < 150 && !sedangDisentak) {
+          const faktorRem = PENGEREM_OVERSHOOT + (1 - PENGEREM_OVERSHOOT) * (jarak / 150);
+          Body.setVelocity(k.benda, {
+            x: k.benda.velocity.x * faktorRem,
+            y: k.benda.velocity.y * faktorRem
+          });
+        }
+      });
+    }
+
+    Engine.update(mesin, selisih / LANGKAH);
+    kotak.forEach(function (k) { batasiKecepatan(k.benda); });
+  }
+
+  if (magnet.aktif) {
+    magnet.fase += selisih * 0.005;
+  }
+
+  perbaruiEfekJelly();
+
+  // Bersihkan layar
+  ctx.fillStyle = "#000";
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+  // Gambar Efek Lingkaran Denyut Magnet
+  if (magnet.aktif) {
+    const pulse = Math.sin(magnet.fase) * 6;
+    for (let i = 0; i < 3; i++) {
+      ctx.beginPath();
+      ctx.arc(magnet.x, magnet.y, 30 + i * 20 + pulse, 0, Math.PI * 2);
+      ctx.strokeStyle = "rgba(97, 205, 255, " + (0.75 - i * 0.18) + ")";
+      ctx.lineWidth = 2;
+      ctx.shadowColor = "#48cfff";
+      ctx.shadowBlur = 14;
+      ctx.stroke();
+    }
+    ctx.shadowBlur = 0;
+    ctx.beginPath();
+    ctx.arc(magnet.x, magnet.y, 6, 0, Math.PI * 2);
+    ctx.fillStyle = "#d9f7ff";
+    ctx.fill();
+  }
+
+  // Gambar Efek Ledakan
+  ledakan.forEach(function (e) {
+    e.umur += selisih / 760;
+    const progres = Math.min(e.umur, 1);
+    const alpha = 1 - progres;
+
+    if (e.umur > 0.08 && e.asapDibuat !== true) {
+      e.asapDibuat = true;
+      const jumlahAsap = perangkatMobile ? 2 : 8;
+      for (let i = 0; i < jumlahAsap; i++) {
+        const batasAsap = perangkatMobile ? 32 : 120;
+        if (asapTerpisah.length >= batasAsap) asapTerpisah.shift();
+        const sebaran = 28 + Math.random() * Math.min(JARI_JARI_LEDAKAN * 0.38, 150);
+        const offsetX = (Math.random() - 0.5) * sebaran;
+        const offsetY = (Math.random() - 0.5) * sebaran * 0.3;
+        asapTerpisah.push({
+          x: e.x + offsetX,
+          y: e.y + offsetY + 8,
+          vx: Math.sign(offsetX || (Math.random() - 0.5)) * (0.35 + Math.random() * 0.85),
+          vy: -(0.3 + Math.random() * 0.55),
+          ukuran: 14 + Math.random() * 18,
+          umur: 0,
+          durasi: 3.2 + Math.random() * 1.6
+        });
+      }
+    }
+
+    const radiusGlow = 100 * alpha + 2;
+    ctx.globalAlpha = alpha;
+    ctx.drawImage(teksturLedakan, e.x - radiusGlow, e.y - radiusGlow, radiusGlow * 2, radiusGlow * 2);
+    ctx.globalAlpha = 1;
+
+    for (let cincin = 0; cincin < 3; cincin++) {
+      const t = Math.min(1, progres + cincin * 0.09);
+      ctx.beginPath();
+      ctx.arc(e.x, e.y, 12 + t * JARI_JARI_LEDAKAN, 0, Math.PI * 2);
+      ctx.strokeStyle = "rgba(" + (cincin === 0 ? "255, 245, 190" : "255, 111, 48") + ", " + alpha * (0.8 - cincin * 0.18) + ")";
+      ctx.lineWidth = (cincin === 0 ? 7 : 3) * alpha + 0.5;
+      ctx.shadowColor = "#ff8a35";
+    ctx.shadowBlur = (perangkatMobile ? 2 : 8) * alpha;
+      ctx.stroke();
+    }
+    ctx.shadowBlur = 0;
+
+    ctx.save();
+    ctx.translate(e.x, e.y);
+    ctx.rotate(e.rotasi + progres * 1.2);
+    ctx.beginPath();
+    ctx.moveTo(-7 * alpha, 0);
+    ctx.lineTo(0, -46 * alpha);
+    ctx.lineTo(7 * alpha, 0);
+    ctx.lineTo(0, 30 * alpha);
+    ctx.closePath();
+    ctx.fillStyle = "rgba(255, 247, 210, " + alpha * 0.85 + ")";
+    ctx.shadowColor = "#ffb342";
+    ctx.shadowBlur = (perangkatMobile ? 3 : 10) * alpha;
+    ctx.fill();
+    ctx.restore();
+
+    for (let i = 0; i < e.partikel.length; i++) {
+      const p = e.partikel[i];
+      p.x += p.vx * (selisih / 16);
+      p.y += p.vy * (selisih / 16);
+      p.vx *= 0.985;
+      p.vy *= 0.985;
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, p.ukuran * alpha, 0, Math.PI * 2);
+      ctx.fillStyle = "rgba(" + p.warna + ", " + alpha + ")";
+      ctx.shadowBlur = 0;
+      ctx.fill();
+    }
+    ctx.shadowBlur = 0;
+  });
+
+  // Gambar Partikel Asap
+  for (let i = asapTerpisah.length - 1; i >= 0; i--) {
+    const p = asapTerpisah[i];
+    p.umur += selisih / 1000;
+    p.x += p.vx * selisih / 16;
+    p.y += p.vy * selisih / 16;
+    p.ukuran += selisih * 0.018;
+    p.vx *= 0.999;
+    const asapAlpha = Math.max(0, 0.5 * (1 - p.umur / p.durasi));
+    if (asapAlpha <= 0) {
+      asapTerpisah.splice(i, 1);
+      continue;
+    }
+    ctx.globalAlpha = Math.min(1, asapAlpha / 0.9);
+    ctx.drawImage(teksturAsap, p.x - p.ukuran, p.y - p.ukuran, p.ukuran * 2, p.ukuran * 2);
+    ctx.globalAlpha = 1;
+  }
+
+  for (let i = ledakan.length - 1; i >= 0; i--) {
+    if (ledakan[i].umur >= 1) ledakan.splice(i, 1);
+  }
+
+  // Render Kotak
+  kotak.forEach(function (k) {
+    ctx.save();
+    const aktif = k.benda === geser.body;
+    const amplitudo = aktif ? 0.002 : k.getar;
+    const getarX = Math.sin(k.faseGetar) * amplitudo * (aktif ? 4 : 2.5);
+    const getarY = Math.cos(k.faseGetar * 1.13) * amplitudo * (aktif ? 4 : 2.5);
+    ctx.translate(k.benda.position.x + getarX, k.benda.position.y + getarY);
+    ctx.rotate(k.benda.angle + k.miringJelly);
+    ctx.scale(k.regangX, k.regangY);
+    ctx.drawImage(k.gambar, -k.lebar / 2, -k.tinggi / 2, k.lebar, k.tinggi);
+    ctx.restore();
+
+    // Mode partikel diatur per gambar dan koordinatnya mengikuti kotak.
+    if (k.partikelObjek) {
+      k.waktuPartikel += selisih;
+      const mode = k.efekPartikel.mode;
+      const interval = k.efekPartikel.interval || 420;
+      if (k.waktuPartikel >= interval) {
+        k.waktuPartikel %= interval;
+        const simbolKategori = KATEGORI_EMOJI_PARTIKEL[mode] || KATEGORI_EMOJI_PARTIKEL.sparkle;
+        k.partikelObjek.push({
+          x: (Math.random() - 0.5) * k.lebar * 0.65,
+          y: -k.tinggi * (0.28 + Math.random() * 0.12),
+          vx: (Math.random() - 0.5) * 0.55,
+          vy: -1.35 - Math.random() * 0.55,
+          umur: 0,
+          durasi: k.efekPartikel.durasi || 2200 + Math.random() * 600,
+          ukuran: Math.max(14, Math.min(42, Math.min(k.lebar, k.tinggi) * (0.14 + Math.random() * 0.1))),
+          simbol: simbolKategori[Math.floor(Math.random() * simbolKategori.length)]
+        });
+      }
+      ctx.save();
+      ctx.translate(k.benda.position.x + getarX, k.benda.position.y + getarY);
+      ctx.rotate(k.benda.angle + k.miringJelly);
+      ctx.scale(k.regangX, k.regangY);
+      for (let i = k.partikelObjek.length - 1; i >= 0; i--) {
+        const partikel = k.partikelObjek[i];
+        partikel.umur += selisih;
+        partikel.x += partikel.vx * selisih / 16;
+        partikel.y += partikel.vy * selisih / 16;
+        if (partikel.umur >= partikel.durasi) {
+          k.partikelObjek.splice(i, 1);
+          continue;
+        }
+        ctx.globalAlpha = 1 - partikel.umur / partikel.durasi;
+        ctx.font = partikel.ukuran + "px serif";
+        ctx.textAlign = "center";
+        ctx.textBaseline = "middle";
+        ctx.fillText(partikel.simbol, partikel.x, partikel.y);
+        ctx.globalAlpha = 1;
+      }
+      ctx.restore();
+    }
+  });
+
+  requestAnimationFrame(animasi);
+}
+
+requestAnimationFrame(animasi);
+</script>
+</body>
+</html>
